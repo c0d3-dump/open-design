@@ -1,0 +1,213 @@
+name: fork-macos-release
+
+# Fork-scoped macOS desktop release.
+#
+# The upstream release pipelines (`release-beta`, `release-prerelease`,
+# `release-stable`) publish signed packages into the shared R2 release buckets
+# and are gated to `nexu-io/open-design`, so a fork cannot and must not use
+# them. This workflow is the fork's own deliverable: it builds the same
+# `tools-pack mac` artifact on a GitHub macOS runner and attaches the DMG and
+# ZIP to a GitHub Release in this repository.
+#
+# It intentionally does not publish updater metadata, does not touch any
+# channel feed, and does not require Apple notarization credentials. The
+# resulting app is an unsigned portable build: `tools-pack mac install` copies
+# it under the tools-pack install root, and a human can drag it to
+# /Applications after removing the quarantine attribute.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "GitHub Release tag to create (e.g. v0.27.2-command-code.1)."
+        required: true
+        type: string
+      release_name:
+        description: "GitHub Release title. Empty uses the tag."
+        required: false
+        type: string
+        default: ""
+      app_version:
+        description: "Packaged app version. Empty uses the repository package version."
+        required: false
+        type: string
+        default: ""
+      ref:
+        description: "Optional git ref to build. Empty builds the dispatched ref."
+        required: false
+        type: string
+        default: ""
+      mac_target:
+        description: "tools-pack mac build target."
+        required: true
+        type: choice
+        options:
+          - all
+          - dmg
+          - zip
+        default: all
+      signed:
+        description: "Codesign the bundle. Requires APPLE_SIGNING_CERTIFICATE_BASE64; leave OFF without it."
+        required: true
+        type: boolean
+        default: false
+      prune_previous_release:
+        description: "Delete an existing GitHub Release with the same tag before recreating it."
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-macos-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "1"
+
+jobs:
+  build-and-release:
+    name: Build macOS app and publish GitHub Release
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ inputs.ref != '' && inputs.ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Resolve build identity
+        id: identity
+        env:
+          INPUT_APP_VERSION: ${{ inputs.app_version }}
+          INPUT_RELEASE_NAME: ${{ inputs.release_name }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          app_version="$INPUT_APP_VERSION"
+          if [ -z "$app_version" ]; then
+            app_version="$(node -p "require('./package.json').version")"
+          fi
+          release_name="$INPUT_RELEASE_NAME"
+          if [ -z "$release_name" ]; then
+            release_name="$INPUT_RELEASE_TAG"
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
+          echo "release_name=$release_name" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare signing certificate
+        if: ${{ inputs.signed }}
+        env:
+          APPLE_SIGNING_CERTIFICATE_BASE64: ${{ secrets.APPLE_SIGNING_CERTIFICATE_BASE64 }}
+          APPLE_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_SIGNING_CERTIFICATE_BASE64:-}" ]; then
+            echo "signed=true requires the APPLE_SIGNING_CERTIFICATE_BASE64 secret" >&2
+            exit 1
+          fi
+          cert_path="$RUNNER_TEMP/open-design-signing.p12"
+          printf '%s' "$APPLE_SIGNING_CERTIFICATE_BASE64" | base64 --decode > "$cert_path"
+          {
+            echo "CSC_LINK=$cert_path"
+            echo "CSC_KEY_PASSWORD=$APPLE_SIGNING_CERTIFICATE_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+      - name: Build macOS app
+        env:
+          APP_VERSION: ${{ steps.identity.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          build_args=(
+            exec tools-pack mac build
+            --dir "$RUNNER_TEMP/tools-pack"
+            --namespace release-beta
+            --portable
+            --app-version "$APP_VERSION"
+            --to "${{ inputs.mac_target }}"
+            --json
+          )
+          if [ "${{ inputs.signed }}" = "true" ]; then
+            build_args+=(--signed)
+          fi
+          pnpm "${build_args[@]}" | tee "$RUNNER_TEMP/build.json"
+
+      - name: Collect release assets
+        id: assets
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/tools-pack/out/mac/namespaces/release-beta"
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          find "$out" -maxdepth 3 -name '*.dmg' -exec cp {} "$RUNNER_TEMP/release-assets/" \;
+          find "$out" -maxdepth 3 -name '*.zip' -exec cp {} "$RUNNER_TEMP/release-assets/" \;
+          count="$(find "$RUNNER_TEMP/release-assets" -type f | wc -l | tr -d ' ')"
+          if [ "$count" = "0" ]; then
+            echo "no dmg/zip produced under $out" >&2
+            ls -R "$out" || true
+            exit 1
+          fi
+          (cd "$RUNNER_TEMP/release-assets" && shasum -a 256 ./* > SHA256SUMS)
+          ls -l "$RUNNER_TEMP/release-assets"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: open-design-fork-macos
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Delete existing release for this tag
+        if: ${{ inputs.prune_previous_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release delete "$TAG" --yes --cleanup-tag || true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+          RELEASE_NAME: ${{ steps.identity.outputs.release_name }}
+          APP_VERSION: ${{ steps.identity.outputs.app_version }}
+          COMMIT: ${{ steps.identity.outputs.commit }}
+        run: |
+          set -euo pipefail
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "Open Design macOS desktop build (arm64)."
+            echo
+            echo "- app version: \`$APP_VERSION\`"
+            echo "- commit: \`$COMMIT\`"
+            echo "- artifact: portable, built by \`tools-pack mac build --portable\`"
+            echo
+            echo "Install: open the DMG and drag Open Design into /Applications, or"
+            echo "unzip the portable ZIP and run \`tools-pack mac install\`. The build is"
+            echo "unsigned unless this dispatch enabled \`signed\`, so the first launch may"
+            echo "need \`xattr -dr com.apple.quarantine\` on the app bundle."
+          } > "$notes_file"
+          gh release create "$TAG" \
+            --title "$RELEASE_NAME" \
+            --target "$COMMIT" \
+            --notes-file "$notes_file" \
+            "$RUNNER_TEMP"/release-assets/*

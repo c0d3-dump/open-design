@@ -875,6 +875,7 @@ const AGENT_SHORT_DESCRIPTIONS: Record<string, string> = {
   hermes: 'ACP agent CLI',
   'grok-build': 'xAI coding CLI',
   reasonix: 'DeepSeek native coding CLI',
+  'command-code': 'Command Code CLI',
 };
 
 function cleanAgentVersionLabel(

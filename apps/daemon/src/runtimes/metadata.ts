@@ -95,6 +95,10 @@ const AGENT_INSTALL_LINKS: Record<
     installUrl: 'https://atomcode.atomgit.com/docs/en/quickstart.html',
     docsUrl: 'https://atomcode.atomgit.com/docs/en/index.html',
   },
+  'command-code': {
+    installUrl: 'https://www.npmjs.com/package/command-code',
+    docsUrl: 'https://commandcode.ai/docs',
+  },
 };
 
 function sanitizeHttpsUrl(value: string | undefined): string | undefined {
