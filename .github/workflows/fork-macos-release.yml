@@ -134,12 +134,15 @@ jobs:
       - name: Build macOS app
         env:
           APP_VERSION: ${{ steps.identity.outputs.app_version }}
+          # With no certificate present, electron-builder would otherwise try to
+          # discover a signing identity and fail the build. Turning discovery off
+          # is what makes an unsigned local/CI build succeed.
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ inputs.signed }}
         run: |
           set -euo pipefail
           build_args=(
             exec tools-pack mac build
             --dir "$RUNNER_TEMP/tools-pack"
-            --namespace release-beta
             --portable
             --app-version "$APP_VERSION"
             --to "${{ inputs.mac_target }}"
@@ -154,10 +157,10 @@ jobs:
         id: assets
         run: |
           set -euo pipefail
-          out="$RUNNER_TEMP/tools-pack/out/mac/namespaces/release-beta"
+          out="$RUNNER_TEMP/tools-pack/out/mac/namespaces"
           mkdir -p "$RUNNER_TEMP/release-assets"
-          find "$out" -maxdepth 3 -name '*.dmg' -exec cp {} "$RUNNER_TEMP/release-assets/" \;
-          find "$out" -maxdepth 3 -name '*.zip' -exec cp {} "$RUNNER_TEMP/release-assets/" \;
+          find "$out" -maxdepth 4 -name '*.dmg' -exec cp {} "$RUNNER_TEMP/release-assets/" \;
+          find "$out" -maxdepth 4 -name '*.zip' -exec cp {} "$RUNNER_TEMP/release-assets/" \;
           count="$(find "$RUNNER_TEMP/release-assets" -type f | wc -l | tr -d ' ')"
           if [ "$count" = "0" ]; then
             echo "no dmg/zip produced under $out" >&2
